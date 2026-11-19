@@ -1,0 +1,10 @@
+title = "InSight Gitleaks Configuration"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Allowlist documented empty environment templates only (.env.example)"
+paths = [
+  '''^\.env\.example$''',
+]

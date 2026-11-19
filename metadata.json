@@ -1,0 +1,11 @@
+{
+  "name": "نظام حضور وانصراف الموظفين عبر QR",
+  "description": "منصة إلكترونية آمنة لتسجيل حضور وانصراف الموظفين عبر رموز QR المتغيرة والتحقق الجغرافي وإدارة الموارد البشرية.",
+  "requestFramePermissions": [
+    "camera",
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

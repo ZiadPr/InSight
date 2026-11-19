@@ -1,0 +1,105 @@
+name: InSight CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Build, Audit, SBOM & Security Tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies cleanly from lockfile
+        run: npm ci
+
+      - name: Dependency vulnerability gate (npm audit >= high)
+        run: npm audit --audit-level=high
+
+      - name: License compliance verification
+        run: npm run check:licenses
+
+      - name: TypeScript type check
+        run: npm run lint
+
+      - name: Production Vite build
+        run: npm run build
+
+      - name: Verify production bundle contains zero secrets or demo credentials
+        run: npm run check:bundle
+
+      - name: Server & migration syntax check (Node 22 native TS)
+        run: |
+          node --check server.ts
+          node --check server/sqliteStore.ts
+          node --check scripts/migrate-json-db-to-sqlite.ts
+
+      - name: Security, storage & attendance test suite
+        run: npm test
+
+      - name: Generate CycloneDX SBOM
+        run: npm run sbom
+
+      - name: Upload CycloneDX SBOM artifact (main branch)
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: insight-sbom-cyclonedx-${{ github.sha }}
+          path: sbom.cdx.json
+          retention-days: 90
+          if-no-files-found: error
+
+  secret-scan:
+    name: Secret Scanning (Gitleaks)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout full history for secret scan
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks secret scanner
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+
+  codeql-sast:
+    name: CodeQL SAST (Server & Edge Security Logic)
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL for JavaScript/TypeScript
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Perform CodeQL SAST Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:javascript-typescript"

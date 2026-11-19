@@ -1,0 +1,30 @@
+project_id = "university-qr-attendance"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[auth]
+enabled = true
+enable_signup = false
+minimum_password_length = 10
+
+[auth.email]
+enable_signup = false
+double_confirm_changes = true
+enable_confirmations = true
+
+[functions.kiosk-issue-token]
+verify_jwt = true
+
+[functions.kiosk-token-status]
+verify_jwt = true
+
+[functions.attendance-check-in]
+verify_jwt = true
+
+[functions.export-attendance]
+verify_jwt = true

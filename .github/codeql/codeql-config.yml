@@ -1,0 +1,17 @@
+name: "InSight Security SAST Config"
+
+queries:
+  - uses: security-extended
+  - uses: security-and-quality
+
+paths:
+  - server.ts
+  - server
+  - src
+  - scripts
+  - examples/optional-supabase-mode/functions
+
+paths-ignore:
+  - dist
+  - node_modules
+  - coverage

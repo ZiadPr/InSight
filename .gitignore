@@ -1,0 +1,27 @@
+# Dependencies & Build Outputs
+node_modules/
+build/
+dist/
+coverage/
+sbom.cdx.json
+
+# Environment & Secrets (NEVER commit secrets or local master keys)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Encrypted Local Runtime Database & Master Key
+data/
+
+# Logs & OS Artifacts
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# IDE / Workspace Temp Files
+.vscode/
+.idea/
+public/assets/aistudio/
