@@ -8,6 +8,8 @@
 
 > **ملاحظة معمارية (ADR-001):** مسار **Express ذاتي الاستضافة (`server.ts`)** هو المسار الرسمي الوحيد المتصل بالواجهة الأمامية لضمان تكافؤ جميع ضوابط التشفير والأمان. أما ترحيلات Supabase القديمة فقد نُقلت إلى [`examples/optional-supabase-mode/`](examples/optional-supabase-mode/README.md) كمرجع أرشيفي تجريبي غير مكافئ أمنياً.
 
+> **النشر على Netlify:** يشغّل نفس خادم Express مع قاعدة PostgreSQL دائمة بدل SQLite المحلية. راجع [دليل Netlify](docs/NETLIFY.md) لإعداد حساب المدير والتشغيل.
+
 ---
 
 ## المزايا الرئيسية

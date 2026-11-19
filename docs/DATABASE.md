@@ -1,5 +1,7 @@
 # Database Design, Retention Policy & Benchmarks (InSight / ان سايت)
 
+> For Netlify hosting, follow [the Netlify deployment guide](NETLIFY.md). The local SQLite storage and persistent-volume requirements below apply to self-hosted deployments.
+
 > **Official Runtime Storage (`ADR-001` / `ADR-002`):** The official Express runtime (`server.ts`) uses **embedded SQLite via `better-sqlite3`** (`data/attendance.db`) in **WAL mode (`PRAGMA journal_mode = WAL`, `synchronous = NORMAL`, `foreign_keys = ON`)** with **`0o600` POSIX permissions** and **column-level AES-256-GCM encryption** keyed by `DATA_ENCRYPTION_KEY`.
 >
 > Every check-in/check-out (`/api/attendance/scan`) executes inside a single atomic SQLite transaction updating **only** the consumed QR token, inserting/updating **only** the single affected `attendance_records` row, and appending **one** audit row — eliminating full-database serialization and rewrite overhead.

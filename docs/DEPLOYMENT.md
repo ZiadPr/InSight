@@ -1,5 +1,7 @@
 # Deployment & Operations Runbook (InSight / ان سايت)
 
+> For Netlify hosting, follow [the Netlify deployment guide](NETLIFY.md). The local SQLite storage and persistent-volume requirements below apply to self-hosted deployments.
+
 ## 1. Prerequisites & Single-Node Scaling Boundary
 - **Single-Node Deployment Model (Instance واحد فقط):** Per [`docs/DECISIONS.md`](DECISIONS.md) (`ADR-001` & `ADR-002`), the official `server.ts` runtime stores data in an embedded **SQLite WAL** database (`data/attendance.db`) with column-level AES-256-GCM encryption and maintains ephemeral ECDH transport channels in process memory. Deploy **strictly 1 active instance** (`replicas = 1` / `max-instances = 1`) backed by a persistent local SSD volume mounted at `/app/data`.
 - Multi-instance horizontal scaling is **not supported** with local SQLite; organizations requiring multi-node active-active clusters must adopt a shared external PostgreSQL database + distributed Redis store (`examples/optional-supabase-mode/` reference).

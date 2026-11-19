@@ -1,3 +1,5 @@
+import "express-async-errors";
+import { resolveHostedStorageKey } from "./server/storageKey.ts";
 import net from "node:net";
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -47,6 +49,7 @@ interface AuthenticatedRequest extends Request {
   secChannel?: SecChannel;
 }
 
+const IS_NETLIFY = process.env.INSIGHT_NETLIFY === "true";
 const IS_PRODUCTION = process.env.NODE_ENV === "production";
 
 function resolveListenPort(): number {
@@ -707,7 +710,7 @@ function buildProductionBootstrapDatabase(): DatabaseState {
 
   if (!envEmail || !envPassword || !envKioskSecret) {
     console.warn(
-      `[SECURITY NOTICE] Bootstrapped production database with CSPRNG credentials for ${adminEmail}. Set ADMIN_BOOTSTRAP_EMAIL/ADMIN_BOOTSTRAP_PASSWORD/KIOSK_BOOTSTRAP_SECRET for custom bootstrap values.`,
+      "[SECURITY NOTICE] Production bootstrap used generated credentials for unconfigured accounts or devices. Configure bootstrap settings to supply custom values.",
     );
   }
 
@@ -840,7 +843,9 @@ function normalizeLegacyDatabaseState(raw: DatabaseState): DatabaseState {
   return raw;
 }
 
-const masterKey = getOrCreateMasterKey();
+const masterKey = IS_NETLIFY
+  ? resolveHostedStorageKey(process.env.DATA_ENCRYPTION_KEY, process.env.ADMIN_BOOTSTRAP_PASSWORD)
+  : getOrCreateMasterKey();
 
 function initializeSqliteStore(): SqliteAttendanceStore {
   if (!fs.existsSync(DATA_DIR)) {
@@ -897,23 +902,39 @@ function initializeSqliteStore(): SqliteAttendanceStore {
   return sqliteStore;
 }
 
-const store = initializeSqliteStore();
-const runtimeSecrets = store.getRuntimeSecrets();
-store.assertNoDefaultCredentialsInProduction(
+const store = IS_NETLIFY
+  ? await (async () => {
+      const { PostgresAttendanceStore } = await import("./server/postgresStore.js");
+      const { PostgresConnection } = await import("./server/postgresConnection.js");
+      const connection = new PostgresConnection();
+      const postgres = new PostgresAttendanceStore(masterKey, connection);
+      await connection.transaction(async () => {
+        if (!(await postgres.isInitialized())) {
+          if (!process.env.ADMIN_BOOTSTRAP_EMAIL || !process.env.ADMIN_BOOTSTRAP_PASSWORD || !isStrongPassword(process.env.ADMIN_BOOTSTRAP_PASSWORD) || process.env.ADMIN_BOOTSTRAP_PASSWORD.length < 12) {
+            throw new Error("Configure an admin email and a strong bootstrap password (12+ characters) before starting the server.");
+          }
+          await postgres.importDatabaseState(buildProductionBootstrapDatabase());
+        }
+      })();
+      return postgres;
+    })()
+  : initializeSqliteStore();
+const runtimeSecrets = (await store.getRuntimeSecrets());
+(await store.assertNoDefaultCredentialsInProduction(
   IS_PRODUCTION,
   verifyPassword,
   hashPassword,
   sha256Hex,
   constantTimeEqual,
   runtimeSecrets.kiosk_salt,
-);
+));
 
 const serverSigningPrivateKey = crypto.createPrivateKey(runtimeSecrets.signing_private_pem);
 const serverSigningPublicSpki = runtimeSecrets.signing_public_spki;
 const serverSigningKeyId = sha256Hex(serverSigningPublicSpki).slice(0, 16);
 
-store.cleanupExpiredAndAgedData();
-setInterval(() => store.cleanupExpiredAndAgedData(), 6 * 3600 * 1000).unref();
+(await store.cleanupExpiredAndAgedData());
+
 
 process.on("SIGINT", () => {
   store.close();
@@ -924,9 +945,9 @@ process.on("SIGTERM", () => {
   process.exit(0);
 });
 
-function extractClientIp(req: Request): string {
+async function extractClientIp(req: Request): Promise<string> {
   // Use Cloudflare's validated edge header ONLY when Cloudflare proxy protection is explicitly active and CF-Ray is present.
-  const policy = store.getSecurityPolicy();
+  const policy = (await store.getSecurityPolicy());
   if (policy.cloudflare_enabled && policy.trust_cf_headers && req.header("cf-ray")) {
     const cfIp = (req.header("cf-connecting-ip") ?? "").trim();
     if (cfIp && net.isIP(cfIp) !== 0) {
@@ -937,8 +958,8 @@ function extractClientIp(req: Request): string {
   return req.ip || req.socket.remoteAddress || "unknown";
 }
 
-function getIpHash(req: Request): string {
-  return hmacSha256Hex(runtimeSecrets.ip_salt, extractClientIp(req));
+async function getIpHash(req: Request): Promise<string> {
+  return hmacSha256Hex(runtimeSecrets.ip_salt, (await extractClientIp(req)));
 }
 
 function getUaHash(req: Request): string {
@@ -949,14 +970,14 @@ function getUaHash(req: Request): string {
 // Ephemeral in-memory ECDH P-256 + HKDF-SHA256 + AES-256-GCM transport channels
 const secChannels = new Map<string, SecChannel>();
 
-setInterval(() => {
+function pruneTransportChannels() {
   const now = Date.now();
   for (const [id, ch] of secChannels.entries()) {
     if (ch.expiresAtMs <= now) {
       secChannels.delete(id);
     }
   }
-}, 60_000).unref();
+}
 
 function encryptTransportFrame(
   key: Buffer,
@@ -1060,7 +1081,7 @@ const SESSION_POLICIES: Record<
   kiosk: { idleMs: 12 * 3600_000, absoluteMs: 12 * 3600_000, maxConcurrent: 1 },
 };
 
-function signSessionToken(user: StoredUser, uaHash: string, ipHash: string): string {
+async function signSessionToken(user: StoredUser, uaHash: string, ipHash: string): Promise<string> {
   const nowMs = Date.now();
   const iat = Math.floor(nowMs / 1000);
   const policy = SESSION_POLICIES[user.role];
@@ -1069,7 +1090,7 @@ function signSessionToken(user: StoredUser, uaHash: string, ipHash: string): str
   const jti = crypto.randomUUID();
   const nowIso = new Date(nowMs).toISOString();
 
-  store.createActiveSessionWithEviction(
+  (await store.createActiveSessionWithEviction(
     {
       jti,
       user_id: user.id,
@@ -1084,7 +1105,7 @@ function signSessionToken(user: StoredUser, uaHash: string, ipHash: string): str
     },
     policy.maxConcurrent,
     nowIso,
-  );
+  ));
 
   const payload = Buffer.from(
     JSON.stringify({
@@ -1134,11 +1155,11 @@ function signAdminStepUpToken(
   };
 }
 
-function verifyAdminStepUpToken(
+async function verifyAdminStepUpToken(
   token: string,
   user: StoredUser,
   uaHash: string,
-): { valid: boolean; aal?: "aal1" | "aal2" } {
+): Promise<{ valid: boolean; aal?: "aal1" | "aal2" }> {
   const parts = token.split(".");
   if (parts.length !== 2) return { valid: false };
   const [payload, sig] = parts;
@@ -1169,14 +1190,14 @@ function verifyAdminStepUpToken(
     ) {
       return { valid: false };
     }
-    if (store.isJtiRevoked(decoded.jti)) return { valid: false };
+    if ((await store.isJtiRevoked(decoded.jti))) return { valid: false };
     return { valid: true, aal: decoded.aal ?? "aal1" };
   } catch {
     return { valid: false };
   }
 }
 
-function verifySessionToken(token: string, uaHash?: string): {
+async function verifySessionToken(token: string, uaHash?: string): Promise<{
   sub: string;
   role: UserRole;
   tv: number;
@@ -1184,7 +1205,7 @@ function verifySessionToken(token: string, uaHash?: string): {
   jti: string;
   iat: number;
   exp: number;
-} | null {
+} | null> {
   const parts = token.split(".");
   if (parts.length !== 2) return null;
   const [payload, sig] = parts;
@@ -1214,7 +1235,7 @@ function verifySessionToken(token: string, uaHash?: string): {
       return null;
     }
     if (decoded.exp * 1000 <= Date.now()) return null;
-    if (store.isJtiRevoked(decoded.jti)) return null;
+    if ((await store.isJtiRevoked(decoded.jti))) return null;
     if (uaHash && decoded.ua && !constantTimeEqual(decoded.ua, uaHash)) {
       return null;
     }
@@ -1232,16 +1253,16 @@ function verifySessionToken(token: string, uaHash?: string): {
   }
 }
 
-function resolveUserPermissions(
+async function resolveUserPermissions(
   u: StoredUser,
   rolesMap?: Record<string, RbacRoleDefinition>,
-): PermissionKey[] {
+): Promise<PermissionKey[]> {
   if (u.role !== "admin" || !u.is_active) return [];
   if (Array.isArray(u.permissions) && u.permissions.length > 0) {
     return u.permissions.filter((p): p is PermissionKey => ALL_PERMISSION_KEYS.includes(p));
   }
   const roleKey = u.admin_role_key || "super_admin";
-  const resolvedMap = rolesMap ?? store.getRbacRoles();
+  const resolvedMap = rolesMap ?? (await store.getRbacRoles());
   const def = resolvedMap[roleKey];
   if (def) {
     return def.permissions.filter((p): p is PermissionKey => ALL_PERMISSION_KEYS.includes(p));
@@ -1249,7 +1270,7 @@ function resolveUserPermissions(
   return roleKey === "super_admin" ? [...ALL_PERMISSION_KEYS] : ["view_overview"];
 }
 
-function toPublicProfile(u: StoredUser, rolesMap?: Record<string, RbacRoleDefinition>) {
+async function toPublicProfile(u: StoredUser, rolesMap?: Record<string, RbacRoleDefinition>) {
   return {
     id: u.id,
     email: u.email,
@@ -1261,7 +1282,7 @@ function toPublicProfile(u: StoredUser, rolesMap?: Record<string, RbacRoleDefini
     shift_end: u.shift_end,
     role: u.role,
     admin_role_key: u.admin_role_key ?? null,
-    permissions: u.role === "admin" ? resolveUserPermissions(u, rolesMap) : undefined,
+    permissions: u.role === "admin" ? (await resolveUserPermissions(u, rolesMap)) : undefined,
     is_active: u.is_active,
     mfa_enabled: Boolean(u.mfa_enabled),
     created_at: u.created_at,
@@ -1269,19 +1290,19 @@ function toPublicProfile(u: StoredUser, rolesMap?: Record<string, RbacRoleDefini
   };
 }
 
-function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): void {
+async function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> {
   const authHeader = req.headers.authorization ?? "";
   const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
   if (!token) {
     res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
     return;
   }
-  const verified = verifySessionToken(token, getUaHash(req));
+  const verified = (await verifySessionToken(token, getUaHash(req)));
   if (!verified) {
     res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
     return;
   }
-  const user = store.getUserById(verified.sub);
+  const user = (await store.getUserById(verified.sub));
   if (!user || user.token_version !== verified.tv) {
     res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
     return;
@@ -1292,13 +1313,13 @@ function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunctio
   }
 
   const nowMs = Date.now();
-  const activeSession = store.getActiveSession(verified.jti, user.id);
+  const activeSession = (await store.getActiveSession(verified.jti, user.id));
   if (
     !activeSession ||
     Date.parse(activeSession.absolute_expires_at) <= nowMs ||
     Date.parse(activeSession.idle_expires_at) <= nowMs
   ) {
-    if (activeSession) store.revokeSessionByJti(activeSession.jti);
+    if (activeSession) (await store.revokeSessionByJti(activeSession.jti));
     res.status(401).json({ ok: false, error: "UNAUTHORIZED" });
     return;
   }
@@ -1306,7 +1327,7 @@ function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunctio
   const policy = SESSION_POLICIES[user.role];
   const lastActiveIso = new Date(nowMs).toISOString();
   const nextIdleIso = new Date(nowMs + policy.idleMs).toISOString();
-  store.touchActiveSession(activeSession.jti, lastActiveIso, nextIdleIso);
+  (await store.touchActiveSession(activeSession.jti, lastActiveIso, nextIdleIso));
   activeSession.last_active_at = lastActiveIso;
   activeSession.idle_expires_at = nextIdleIso;
 
@@ -1330,11 +1351,11 @@ function requireEncryptedChannel(
   next();
 }
 
-function verifyAdminStepUpGate(
+async function verifyAdminStepUpGate(
   req: AuthenticatedRequest,
   res: Response,
   enforceMfa: boolean,
-): boolean {
+): Promise<boolean> {
   const user = req.authUser;
   if (!user || user.role !== "admin" || !user.is_active) {
     res.status(403).json({ ok: false, error: "FORBIDDEN" });
@@ -1342,7 +1363,7 @@ function verifyAdminStepUpGate(
   }
   const stepUpHeader = String(req.headers["x-admin-stepup"] ?? "").trim();
   const stepUp = stepUpHeader
-    ? verifyAdminStepUpToken(stepUpHeader, user, getUaHash(req))
+    ? (await verifyAdminStepUpToken(stepUpHeader, user, getUaHash(req)))
     : { valid: false };
   if (!stepUp.valid) {
     res.status(403).json({ ok: false, error: "ADMIN_STEP_UP_REQUIRED" });
@@ -1358,37 +1379,37 @@ function verifyAdminStepUpGate(
   return true;
 }
 
-function requireAdminWithStepUp(
+async function requireAdminWithStepUp(
   req: AuthenticatedRequest,
   res: Response,
   next: NextFunction,
-): void {
-  if (!verifyAdminStepUpGate(req, res, true)) return;
+): Promise<void> {
+  if (!(await verifyAdminStepUpGate(req, res, true))) return;
   next();
 }
 
-function requireAdminStepUpForMfaSetup(
+async function requireAdminStepUpForMfaSetup(
   req: AuthenticatedRequest,
   res: Response,
   next: NextFunction,
-): void {
-  if (!verifyAdminStepUpGate(req, res, false)) return;
+): Promise<void> {
+  if (!(await verifyAdminStepUpGate(req, res, false))) return;
   next();
 }
 
 function requirePermission(permission: PermissionKey) {
-  return (req: AuthenticatedRequest, res: Response, next: NextFunction): void => {
+  return async (req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> => {
     const user = req.authUser;
     if (!user || user.role !== "admin" || !user.is_active) {
       res.status(403).json({ ok: false, error: "FORBIDDEN" });
       return;
     }
-    const perms = resolveUserPermissions(user);
+    const perms = (await resolveUserPermissions(user));
     if (!perms.includes(permission)) {
-      store.addSecurityLog(user.id, "permission_denied", `MISSING_${permission.toUpperCase()}`, getIpHash(req), {
+      (await store.addSecurityLog(user.id, "permission_denied", `MISSING_${permission.toUpperCase()}`, (await getIpHash(req)), {
         required_permission: permission,
         path: req.path,
-      });
+      }));
       res.status(403).json({ ok: false, error: "PERMISSION_DENIED", missing_permission: permission });
       return;
     }
@@ -1396,13 +1417,13 @@ function requirePermission(permission: PermissionKey) {
   };
 }
 
-function emitSecurityAlert(
+async function emitSecurityAlert(
   severity: SecurityAlertEntry["severity"],
   event: string,
   requestId: string | null,
   ipHash: string | null,
   details: Record<string, unknown> = {},
-): void {
+): Promise<void> {
   const alert: SecurityAlertEntry = {
     id: `alert-${crypto.randomUUID()}`,
     severity,
@@ -1412,7 +1433,7 @@ function emitSecurityAlert(
     created_at: new Date().toISOString(),
     details,
   };
-  store.addSecurityAlert(alert);
+  (await store.addSecurityAlert(alert));
 
   if (severity === "critical" || severity === "high") {
     console.warn(JSON.stringify({ level: "SECURITY_ALERT", ...alert }));
@@ -1433,14 +1454,14 @@ function emitSecurityAlert(
 const MAX_RATE_MAP_SIZE = 10_000;
 const rateMap = new Map<string, { attempts: number; windowStart: number; blockedUntil: number }>();
 
-setInterval(() => {
+function pruneRateLimits() {
   const now = Date.now();
   for (const [k, v] of rateMap.entries()) {
     if (v.blockedUntil <= now && now - v.windowStart > 3600_000) {
       rateMap.delete(k);
     }
   }
-}, 120_000).unref();
+}
 
 function checkRateLimit(
   key: string,
@@ -1482,6 +1503,14 @@ async function checkDistributedRateLimit(
   windowMs: number,
   blockMs: number,
 ): Promise<{ allowed: true } | { allowed: false; retryAfterSeconds: number; unavailable?: boolean }> {
+  if (IS_NETLIFY) {
+    try {
+      const { checkPersistentRateLimit } = await import("./server/persistentRateLimit.js");
+      return await checkPersistentRateLimit(key, maxAttempts, windowMs, blockMs);
+    } catch {
+      return { allowed: false, retryAfterSeconds: 30, unavailable: true };
+    }
+  }
   const redisUrl = process.env.REDIS_REST_URL?.trim();
   const redisToken = process.env.REDIS_REST_TOKEN?.trim();
   const requireDistributed = process.env.REQUIRE_DISTRIBUTED_RATE_LIMIT === "true";
@@ -1519,8 +1548,13 @@ async function checkDistributedRateLimit(
   return checkRateLimit(key, maxAttempts, windowMs, blockMs);
 }
 
-function resetRateLimit(key: string): void {
-  rateMap.delete(key);
+async function resetRateLimit(key: string): Promise<void> {
+  if (IS_NETLIFY) {
+    const { resetPersistentRateLimit } = await import("./server/persistentRateLimit.js");
+    await resetPersistentRateLimit(key);
+  } else {
+    rateMap.delete(key);
+  }
 }
 
 async function verifyKioskAuth(
@@ -1531,7 +1565,7 @@ async function verifyKioskAuth(
   if (!user || user.role !== "kiosk" || !user.is_active) {
     return { ok: false, status: 403, error: "FORBIDDEN" };
   }
-  const device = store.getKioskByAuthUserId(user.id);
+  const device = (await store.getKioskByAuthUserId(user.id));
   if (!device || !device.is_active) {
     return { ok: false, status: 403, error: "KIOSK_NOT_AUTHORIZED" };
   }
@@ -1552,7 +1586,7 @@ async function verifyKioskAuth(
     300_000,
     900_000,
   );
-  if (!failLimit.allowed) {
+  if (failLimit.allowed === false) {
     return {
       ok: false,
       status: failLimit.unavailable ? 503 : 429,
@@ -1561,10 +1595,10 @@ async function verifyKioskAuth(
   }
   const providedHash = sha256Hex(`${runtimeSecrets.kiosk_salt}:${providedSecret}`);
   if (!constantTimeEqual(providedHash, device.secret_hash)) {
-    store.addSecurityLog(user.id, "kiosk_auth_failed", "DEVICE_SECRET_INVALID", ipHash);
+    (await store.addSecurityLog(user.id, "kiosk_auth_failed", "DEVICE_SECRET_INVALID", ipHash));
     return { ok: false, status: 403, error: "DEVICE_SECRET_INVALID" };
   }
-  resetRateLimit(`kiosk-secret:${device.id}:${ipHash}`);
+  await resetRateLimit(`kiosk-secret:${device.id}:${ipHash}`);
   return { ok: true, device };
 }
 
@@ -1578,11 +1612,11 @@ function validateGpsTimestamp(clientCapturedAt: unknown): boolean {
   return ageMs <= 30_000 && ageMs >= -10_000;
 }
 
-async function startServer(): Promise<void> {
+export async function createAttendanceApp() {
   const app = express();
   app.disable("x-powered-by");
 
-  const isCloudRun = Boolean(process.env.K_SERVICE || process.env.CLOUD_RUN_JOB);
+  const isCloudRun = Boolean(IS_NETLIFY || process.env.K_SERVICE || process.env.CLOUD_RUN_JOB);
   const trustProxyEnv = process.env.TRUST_PROXY?.trim();
   let trustProxySetting: boolean | number | string | string[] = isCloudRun
     ? 1
@@ -1603,6 +1637,8 @@ async function startServer(): Promise<void> {
 
   // Assign correlation Request ID and enforce 15s request timeout
   app.use((req: AuthenticatedRequest, res, next) => {
+    pruneTransportChannels();
+    pruneRateLimits();
     const reqId = crypto.randomUUID();
     req.requestId = reqId;
     res.setHeader("X-Request-Id", reqId);
@@ -1687,7 +1723,7 @@ async function startServer(): Promise<void> {
     }
   }
 
-  app.use((req: AuthenticatedRequest, res, next) => {
+  app.use(async (req: AuthenticatedRequest, res, next) => {
     res.setHeader("Permissions-Policy", "camera=(self), geolocation=(self), microphone=()");
     res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
     if (req.path.startsWith("/api/")) {
@@ -1695,7 +1731,7 @@ async function startServer(): Promise<void> {
       res.setHeader("Pragma", "no-cache");
       res.setHeader("X-Robots-Tag", "noindex, nofollow");
 
-      const policy = store.getSecurityPolicy();
+      const policy = (await store.getSecurityPolicy());
 
       // 1. Block HTTP Method-Override smuggling headers
       if (
@@ -1779,7 +1815,7 @@ async function startServer(): Promise<void> {
 
       // 4. Cloudflare Free Edge WAF Controls (Country Allowlist + CF-Threat-Score guard)
       if (policy.cloudflare_enabled && req.path !== "/api/health") {
-        const ipHash = getIpHash(req);
+        const ipHash = (await getIpHash(req));
         const cfCountry = (req.header("cf-ipcountry") ?? "").trim().toUpperCase();
         if (
           policy.allowed_countries.length > 0 &&
@@ -1788,13 +1824,13 @@ async function startServer(): Promise<void> {
           cfCountry !== "T1" &&
           !policy.allowed_countries.includes(cfCountry)
         ) {
-          store.addSecurityLog(null, "cf_country_blocked", "COUNTRY_BLOCKED", ipHash, {
+          (await store.addSecurityLog(null, "cf_country_blocked", "COUNTRY_BLOCKED", ipHash, {
             country: cfCountry,
             path: req.path,
-          });
-          emitSecurityAlert("high", "cf_country_blocked", req.requestId ?? null, ipHash, {
+          }));
+          (await emitSecurityAlert("high", "cf_country_blocked", req.requestId ?? null, ipHash, {
             country: cfCountry,
-          });
+          }));
           res.status(403).json({ ok: false, error: "COUNTRY_BLOCKED" });
           return;
         }
@@ -1803,13 +1839,13 @@ async function startServer(): Promise<void> {
         if (threatRaw !== undefined) {
           const score = Number(threatRaw);
           if (Number.isFinite(score) && score >= policy.max_cf_threat_score) {
-            store.addSecurityLog(null, "cf_waf_threat_blocked", "WAF_THREAT_BLOCKED", ipHash, {
+            (await store.addSecurityLog(null, "cf_waf_threat_blocked", "WAF_THREAT_BLOCKED", ipHash, {
               cf_threat_score: score,
               path: req.path,
-            });
-            emitSecurityAlert("critical", "cf_waf_threat_blocked", req.requestId ?? null, ipHash, {
+            }));
+            (await emitSecurityAlert("critical", "cf_waf_threat_blocked", req.requestId ?? null, ipHash, {
               cf_threat_score: score,
-            });
+            }));
             res.status(403).json({ ok: false, error: "WAF_THREAT_BLOCKED" });
             return;
           }
@@ -1828,7 +1864,7 @@ async function startServer(): Promise<void> {
     max: 180,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req) => getIpHash(req),
+    keyGenerator: async (req) => (await getIpHash(req)),
     message: { ok: false, error: "RATE_LIMITED" },
   });
 
@@ -1837,7 +1873,7 @@ async function startServer(): Promise<void> {
     max: 40,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req) => getIpHash(req),
+    keyGenerator: async (req) => (await getIpHash(req)),
     message: { ok: false, error: "RATE_LIMITED" },
   });
 
@@ -1846,7 +1882,7 @@ async function startServer(): Promise<void> {
     max: 80,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req) => getIpHash(req),
+    keyGenerator: async (req) => (await getIpHash(req)),
     message: { ok: false, error: "RATE_LIMITED" },
   });
 
@@ -1855,19 +1891,19 @@ async function startServer(): Promise<void> {
     max: 15,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req) => getIpHash(req),
+    keyGenerator: async (req) => (await getIpHash(req)),
     message: { ok: false, error: "EXPORT_RATE_LIMITED" },
   });
 
   app.use("/api/", globalApiLimiter);
   app.use("/api/hr/", hrAdminLimiter);
 
-  app.get("/api/health", (_req, res) => {
-    const policy = store.getSecurityPolicy();
+  app.get("/api/health", async (_req, res) => {
+    const policy = (await store.getSecurityPolicy());
     res.json({
       ok: true,
       mode: "express-attendance",
-      storage_engine: "sqlite-wal",
+      storage_engine: IS_NETLIFY ? "netlify-postgres" : "sqlite-wal",
       encrypted_storage: true,
       payload_transport: "ECDH-P256-ECDSA-AES-256-GCM (complementary to HTTPS/TLS)",
       waf_sqli_guard: true,
@@ -1876,8 +1912,8 @@ async function startServer(): Promise<void> {
     });
   });
 
-  app.get("/api/auth/public-config", (_req, res) => {
-    const policy = store.getSecurityPolicy();
+  app.get("/api/auth/public-config", async (_req, res) => {
+    const policy = (await store.getSecurityPolicy());
     const hasSecret = Boolean(process.env.TURNSTILE_SECRET_KEY?.trim());
     res.json({
       ok: true,
@@ -1903,7 +1939,7 @@ async function startServer(): Promise<void> {
     })
     .strict();
 
-  app.post("/api/security/handshake", handshakeLimiter, (req, res) => {
+  app.post("/api/security/handshake", handshakeLimiter, async (req, res) => {
     const parsed = handshakeSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ ok: false, error: "INVALID_HANDSHAKE" });
@@ -1939,7 +1975,7 @@ async function startServer(): Promise<void> {
         id: channelId,
         key: aesKey,
         uaHash: getUaHash(req),
-        ipHash: getIpHash(req),
+        ipHash: (await getIpHash(req)),
         expiresAtMs,
       });
 
@@ -1967,7 +2003,7 @@ async function startServer(): Promise<void> {
   });
 
   // Decrypt inbound E2EE envelopes, sanitize & inspect against SQLi/XSS, and encrypt outbound JSON
-  app.use("/api/", (req: AuthenticatedRequest, res, next) => {
+  app.use("/api/", async (req: AuthenticatedRequest, res, next) => {
     if (
       req.path === "/health" ||
       req.path === "/security/handshake" ||
@@ -1982,12 +2018,12 @@ async function startServer(): Promise<void> {
 
     if (channelId) {
       const channel = secChannels.get(channelId);
-      const strictIp = Boolean(store.getSecurityPolicy().strict_ip_binding);
+      const strictIp = Boolean((await store.getSecurityPolicy()).strict_ip_binding);
       if (
         !channel ||
         channel.expiresAtMs <= Date.now() ||
         !constantTimeEqual(channel.uaHash, getUaHash(req)) ||
-        (strictIp && !constantTimeEqual(channel.ipHash, getIpHash(req)))
+        (strictIp && !constantTimeEqual(channel.ipHash, (await getIpHash(req))))
       ) {
         secChannels.delete(channelId);
         res.status(428).json({ ok: false, error: "ENCRYPTED_CHANNEL_EXPIRED" });
@@ -2035,15 +2071,15 @@ async function startServer(): Promise<void> {
     const bodyCheck = sanitizeAndInspectValue(req.body);
     const queryCheck = sanitizeAndInspectValue(req.query);
     if (!bodyCheck.safe || !queryCheck.safe) {
-      const ipHash = getIpHash(req);
-      store.addSecurityLog(null, "sqli_or_xss_blocked", "MALICIOUS_INPUT_DETECTED", ipHash, {
+      const ipHash = (await getIpHash(req));
+      (await store.addSecurityLog(null, "sqli_or_xss_blocked", "MALICIOUS_INPUT_DETECTED", ipHash, {
         path: req.path,
         method: req.method,
-      });
-      emitSecurityAlert("high", "sqli_or_xss_blocked", req.requestId ?? null, ipHash, {
+      }));
+      (await emitSecurityAlert("high", "sqli_or_xss_blocked", req.requestId ?? null, ipHash, {
         path: req.path,
         method: req.method,
-      });
+      }));
       res.status(400).json({ ok: false, error: "MALICIOUS_INPUT_DETECTED" });
       return;
     }
@@ -2062,14 +2098,14 @@ async function startServer(): Promise<void> {
 
   // Rate-limited Login with distributed limiter, optional Cloudflare Turnstile verification & alerting
   app.post("/api/auth/login", async (req: AuthenticatedRequest, res) => {
-    const ipHash = getIpHash(req);
+    const ipHash = (await getIpHash(req));
     const parsed = loginSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ ok: false, error: "INVALID_CREDENTIALS" });
       return;
     }
 
-    const policy = store.getSecurityPolicy();
+    const policy = (await store.getSecurityPolicy());
     const turnstileSecret = process.env.TURNSTILE_SECRET_KEY?.trim() ?? "";
     if (policy.turnstile_enabled && turnstileSecret && policy.turnstile_site_key) {
       const cfToken = parsed.data.turnstile_token ?? "";
@@ -2081,7 +2117,7 @@ async function startServer(): Promise<void> {
         const form = new URLSearchParams();
         form.set("secret", turnstileSecret);
         form.set("response", cfToken);
-        form.set("remoteip", extractClientIp(req));
+        form.set("remoteip", (await extractClientIp(req)));
         const verifyRes = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
           method: "POST",
           body: form,
@@ -2089,7 +2125,7 @@ async function startServer(): Promise<void> {
         });
         const verifyJson = (await verifyRes.json()) as { success?: boolean };
         if (!verifyJson.success) {
-          store.addSecurityLog(null, "turnstile_failed", "CAPTCHA_FAILED", ipHash);
+          (await store.addSecurityLog(null, "turnstile_failed", "CAPTCHA_FAILED", ipHash));
           res.status(403).json({ ok: false, error: "CAPTCHA_FAILED" });
           return;
         }
@@ -2104,17 +2140,17 @@ async function startServer(): Promise<void> {
 
     const rateKey = `login:${email}:${ipHash}`;
     const rate = await checkDistributedRateLimit(rateKey, 5, 300_000, 600_000);
-    if (!rate.allowed) {
+    if (rate.allowed === false) {
       if (rate.unavailable) {
         res.status(503).json({ ok: false, error: "RATE_LIMIT_UNAVAILABLE" });
         return;
       }
-      store.addSecurityLog(null, "login_rate_limited", "RATE_LIMITED", ipHash, {
+      (await store.addSecurityLog(null, "login_rate_limited", "RATE_LIMITED", ipHash, {
         email_hash: sha256Hex(email).slice(0, 12),
-      });
-      emitSecurityAlert("high", "login_rate_limited", req.requestId ?? null, ipHash, {
+      }));
+      (await emitSecurityAlert("high", "login_rate_limited", req.requestId ?? null, ipHash, {
         email_hash: sha256Hex(email).slice(0, 12),
-      });
+      }));
       res.status(429).json({
         ok: false,
         error: "RATE_LIMITED",
@@ -2123,37 +2159,37 @@ async function startServer(): Promise<void> {
       return;
     }
 
-    const user = store.getUserByEmail(email);
+    const user = (await store.getUserByEmail(email));
     if (!user || !verifyPassword(password, user.password_salt, user.password_hash)) {
-      store.addSecurityLog(user?.id ?? null, "login_failed", "INVALID_CREDENTIALS", ipHash, {
+      (await store.addSecurityLog(user?.id ?? null, "login_failed", "INVALID_CREDENTIALS", ipHash, {
         email_hash: sha256Hex(email).slice(0, 12),
-      });
+      }));
       res.status(401).json({ ok: false, error: "INVALID_CREDENTIALS" });
       return;
     }
 
     if (!user.is_active) {
-      store.addSecurityLog(user.id, "login_failed", "ACCOUNT_DISABLED", ipHash);
+      (await store.addSecurityLog(user.id, "login_failed", "ACCOUNT_DISABLED", ipHash));
       res.status(403).json({ ok: false, error: "ACCOUNT_UNAVAILABLE" });
       return;
     }
 
-    resetRateLimit(rateKey);
-    const token = signSessionToken(user, getUaHash(req), ipHash);
-    store.addSecurityLog(user.id, "login_succeeded", "OK", ipHash, { role: user.role });
+    await resetRateLimit(rateKey);
+    const token = (await signSessionToken(user, getUaHash(req), ipHash));
+    (await store.addSecurityLog(user.id, "login_succeeded", "OK", ipHash, { role: user.role }));
 
     res.json({
       ok: true,
       token,
-      profile: toPublicProfile(user),
+      profile: (await toPublicProfile(user)),
     });
   });
 
-  app.get("/api/auth/me", requireAuth, (req: AuthenticatedRequest, res) => {
-    const settings = store.getSettings();
+  app.get("/api/auth/me", requireAuth, async (req: AuthenticatedRequest, res) => {
+    const settings = (await store.getSettings());
     res.json({
       ok: true,
-      profile: toPublicProfile(req.authUser!),
+      profile: (await toPublicProfile(req.authUser!)),
       session: req.authSession
         ? {
             aal: req.authSession.aal,
@@ -2172,14 +2208,14 @@ async function startServer(): Promise<void> {
     });
   });
 
-  app.post("/api/auth/logout", (req, res) => {
+  app.post("/api/auth/logout", async (req, res) => {
     const authHeader = req.headers.authorization ?? "";
     const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
     if (token) {
-      const verified = verifySessionToken(token, getUaHash(req));
+      const verified = (await verifySessionToken(token, getUaHash(req)));
       if (verified) {
-        store.revokeSessionByJti(verified.jti);
-        store.addSecurityLog(verified.sub, "logout_succeeded", "SESSION_REVOKED", getIpHash(req));
+        (await store.revokeSessionByJti(verified.jti));
+        (await store.addSecurityLog(verified.sub, "logout_succeeded", "SESSION_REVOKED", (await getIpHash(req))));
       }
     }
     res.json({ ok: true });
@@ -2193,9 +2229,9 @@ async function startServer(): Promise<void> {
     .strict();
 
   // Change own password (invalidates ALL previous sessions & step-up tokens immediately)
-  app.post("/api/auth/change-password", requireAuth, (req: AuthenticatedRequest, res) => {
+  app.post("/api/auth/change-password", requireAuth, async (req: AuthenticatedRequest, res) => {
     const user = req.authUser!;
-    const ipHash = getIpHash(req);
+    const ipHash = (await getIpHash(req));
     const parsed = changePasswordSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ ok: false, error: "WEAK_PASSWORD" });
@@ -2203,7 +2239,7 @@ async function startServer(): Promise<void> {
     }
 
     if (!verifyPassword(parsed.data.current_password, user.password_salt, user.password_hash)) {
-      store.addSecurityLog(user.id, "password_change_failed", "INVALID_CURRENT_PASSWORD", ipHash);
+      (await store.addSecurityLog(user.id, "password_change_failed", "INVALID_CURRENT_PASSWORD", ipHash));
       res.status(400).json({ ok: false, error: "INVALID_CURRENT_PASSWORD" });
       return;
     }
@@ -2215,24 +2251,24 @@ async function startServer(): Promise<void> {
 
     const newSalt = crypto.randomBytes(16).toString("hex");
     const newHash = hashPassword(parsed.data.new_password, newSalt);
-    const updatedUser = store.updateUserPassword(user.id, newSalt, newHash, new Date().toISOString());
+    const updatedUser = (await store.updateUserPassword(user.id, newSalt, newHash, new Date().toISOString()));
 
-    const freshToken = signSessionToken(updatedUser ?? user, getUaHash(req), ipHash);
-    store.addSecurityLog(user.id, "password_changed", "OK", ipHash);
+    const freshToken = (await signSessionToken(updatedUser ?? user, getUaHash(req), ipHash));
+    (await store.addSecurityLog(user.id, "password_changed", "OK", ipHash));
 
     res.json({ ok: true, token: freshToken });
   });
 
   // Kiosk token issuance
   app.post("/api/kiosk/issue-token", requireAuth, async (req: AuthenticatedRequest, res) => {
-    const ipHash = getIpHash(req);
+    const ipHash = (await getIpHash(req));
     const auth = await verifyKioskAuth(req, ipHash);
-    if (!auth.ok) {
+    if (auth.ok === false) {
       res.status(auth.status).json({ ok: false, error: auth.error });
       return;
     }
 
-    const settings = store.getSettings();
+    const settings = (await store.getSettings());
     if (!settings.is_enabled) {
       res.status(400).json({ ok: false, error: "SERVICE_DISABLED" });
       return;
@@ -2243,7 +2279,7 @@ async function startServer(): Promise<void> {
     const schedule = evaluateQrCaptureSchedule(settings, now);
 
     if (!schedule.open) {
-      store.closeKioskQrWindow(auth.device.id, nowIso);
+      (await store.closeKioskQrWindow(auth.device.id, nowIso));
       res.status(200).json({
         ok: false,
         error: "QR_WINDOW_CLOSED",
@@ -2265,7 +2301,7 @@ async function startServer(): Promise<void> {
     const expiresAt = new Date(now.getTime() + ttl * 1000).toISOString();
     const tokenId = crypto.randomUUID();
 
-    store.issueQrToken(
+    (await store.issueQrToken(
       auth.device.id,
       {
         id: tokenId,
@@ -2280,7 +2316,7 @@ async function startServer(): Promise<void> {
         status: "active",
       },
       nowIso,
-    );
+    ));
 
     res.json({
       ok: true,
@@ -2300,18 +2336,18 @@ async function startServer(): Promise<void> {
   });
 
   app.post("/api/kiosk/token-status", requireAuth, async (req: AuthenticatedRequest, res) => {
-    const ipHash = getIpHash(req);
+    const ipHash = (await getIpHash(req));
     const auth = await verifyKioskAuth(req, ipHash);
-    if (!auth.ok) {
+    if (auth.ok === false) {
       res.status(auth.status).json({ ok: false, error: auth.error });
       return;
     }
 
-    const settings = store.getSettings();
+    const settings = (await store.getSettings());
     const now = new Date();
     const schedule = evaluateQrCaptureSchedule(settings, now);
     const tokenId = typeof req.body?.token_id === "string" ? req.body.token_id.trim() : "";
-    const tokenRow = store.getQrTokenForKiosk(tokenId, auth.device.id);
+    const tokenRow = (await store.getQrTokenForKiosk(tokenId, auth.device.id));
     if (!tokenRow) {
       res.status(404).json({ ok: false, error: "TOKEN_NOT_FOUND" });
       return;
@@ -2319,15 +2355,15 @@ async function startServer(): Promise<void> {
 
     if (!schedule.open && tokenRow.status === "active") {
       tokenRow.status = "revoked";
-      store.updateQrTokenStatus(tokenRow.id, "revoked");
+      (await store.updateQrTokenStatus(tokenRow.id, "revoked"));
     } else if (tokenRow.status === "active" && Date.parse(tokenRow.expires_at) <= now.getTime()) {
       tokenRow.status = "expired";
-      store.updateQrTokenStatus(tokenRow.id, "expired");
+      (await store.updateQrTokenStatus(tokenRow.id, "expired"));
     }
 
     const prevSeenMs = auth.device.last_seen_at ? Date.parse(auth.device.last_seen_at) : 0;
     if (!prevSeenMs || now.getTime() - prevSeenMs >= 30_000) {
-      store.touchKioskLastSeen(auth.device.id, now.toISOString());
+      (await store.touchKioskLastSeen(auth.device.id, now.toISOString()));
     }
 
     res.json({
@@ -2342,11 +2378,11 @@ async function startServer(): Promise<void> {
     });
   });
 
-  app.get("/api/attendance/me", requireAuth, (req: AuthenticatedRequest, res) => {
+  app.get("/api/attendance/me", requireAuth, async (req: AuthenticatedRequest, res) => {
     const user = req.authUser!;
-    const settings = store.getSettings();
+    const settings = (await store.getSettings());
     const todayDate = getDateInTimezone(new Date(), settings.timezone);
-    const records = store.getEmployeeAttendanceHistory(user.id, 60);
+    const records = (await store.getEmployeeAttendanceHistory(user.id, 60));
 
     res.json({
       ok: true,
@@ -2366,16 +2402,16 @@ async function startServer(): Promise<void> {
   // Employee Check-In & Check-Out QR Scan (single-row atomic SQLite transaction, zero full-DB rewrite)
   app.post("/api/attendance/scan", requireAuth, async (req: AuthenticatedRequest, res) => {
     const user = req.authUser!;
-    const ipHash = getIpHash(req);
+    const ipHash = (await getIpHash(req));
 
     if (user.role !== "employee" || !user.is_active) {
-      store.addSecurityLog(user.id, "check_in_rejected", "ACCOUNT_UNAVAILABLE", ipHash);
+      (await store.addSecurityLog(user.id, "check_in_rejected", "ACCOUNT_UNAVAILABLE", ipHash));
       res.status(403).json({ ok: false, error: "ACCOUNT_UNAVAILABLE" });
       return;
     }
 
     const userLimit = await checkDistributedRateLimit(`emp-scan:${user.id}`, 10, 60_000, 120_000);
-    if (!userLimit.allowed) {
+    if (userLimit.allowed === false) {
       if (userLimit.unavailable) {
         res.status(503).json({ ok: false, error: "RATE_LIMIT_UNAVAILABLE" });
         return;
@@ -2389,7 +2425,7 @@ async function startServer(): Promise<void> {
     }
 
     const ipLimit = await checkDistributedRateLimit(`ip-scan:${ipHash}`, 40, 60_000, 120_000);
-    if (!ipLimit.allowed) {
+    if (ipLimit.allowed === false) {
       if (ipLimit.unavailable) {
         res.status(503).json({ ok: false, error: "RATE_LIMIT_UNAVAILABLE" });
         return;
@@ -2402,18 +2438,18 @@ async function startServer(): Promise<void> {
       return;
     }
 
-    const settings = store.getSettings();
+    const settings = (await store.getSettings());
     if (!settings.is_enabled) {
-      store.addSecurityLog(user.id, "check_in_rejected", "SERVICE_DISABLED", ipHash);
+      (await store.addSecurityLog(user.id, "check_in_rejected", "SERVICE_DISABLED", ipHash));
       res.status(400).json({ ok: false, error: "SERVICE_DISABLED" });
       return;
     }
 
     const qrSchedule = evaluateQrCaptureSchedule(settings, new Date());
     if (!qrSchedule.open) {
-      store.addSecurityLog(user.id, "check_in_rejected", "QR_WINDOW_CLOSED", ipHash, {
+      (await store.addSecurityLog(user.id, "check_in_rejected", "QR_WINDOW_CLOSED", ipHash, {
         next_reappear_time: qrSchedule.next_reappear_time,
-      });
+      }));
       res.status(403).json({
         ok: false,
         error: "QR_WINDOW_CLOSED",
@@ -2438,7 +2474,7 @@ async function startServer(): Promise<void> {
     }
 
     // Deduplicate identical idempotency key for same employee
-    if (idempotencyKey && store.hasAttendanceIdempotencyKey(user.id, idempotencyKey)) {
+    if (idempotencyKey && (await store.hasAttendanceIdempotencyKey(user.id, idempotencyKey))) {
       res.status(409).json({ ok: false, error: "QR_INVALID" });
       return;
     }
@@ -2450,19 +2486,19 @@ async function startServer(): Promise<void> {
         ? sha256Hex(normalizedManual)
         : null;
 
-    const tokenLookup = store.findQrTokenForScan(tokenHash, manualCodeHash);
+    const tokenLookup = (await store.findQrTokenForScan(tokenHash, manualCodeHash));
     if (!tokenLookup) {
-      store.addSecurityLog(user.id, "check_in_rejected", "QR_UNKNOWN", ipHash, {
+      (await store.addSecurityLog(user.id, "check_in_rejected", "QR_UNKNOWN", ipHash, {
         attempted_manual: Boolean(manualCodeHash),
-      });
+      }));
       res.status(400).json({ ok: false, error: "QR_INVALID" });
       return;
     }
 
     const { token: tokenRow, entryMethod } = tokenLookup;
-    const kiosk = store.getKioskById(tokenRow.kiosk_device_id);
+    const kiosk = (await store.getKioskById(tokenRow.kiosk_device_id));
     if (!kiosk || !kiosk.is_active) {
-      store.addSecurityLog(user.id, "check_in_rejected", "KIOSK_INACTIVE", ipHash);
+      (await store.addSecurityLog(user.id, "check_in_rejected", "KIOSK_INACTIVE", ipHash));
       res.status(400).json({ ok: false, error: "QR_INVALID" });
       return;
     }
@@ -2471,19 +2507,19 @@ async function startServer(): Promise<void> {
     const nowIso = now.toISOString();
 
     if (tokenRow.status !== "active") {
-      store.addSecurityLog(
+      (await store.addSecurityLog(
         user.id,
         "check_in_rejected",
         `QR_NOT_ACTIVE_${tokenRow.status.toUpperCase()}`,
         ipHash,
-      );
+      ));
       res.status(400).json({ ok: false, error: "QR_INVALID" });
       return;
     }
 
     if (Date.parse(tokenRow.expires_at) <= now.getTime()) {
-      store.updateQrTokenStatus(tokenRow.id, "expired");
-      store.addSecurityLog(user.id, "check_in_rejected", "QR_EXPIRED", ipHash);
+      (await store.updateQrTokenStatus(tokenRow.id, "expired"));
+      (await store.addSecurityLog(user.id, "check_in_rejected", "QR_EXPIRED", ipHash));
       res.status(400).json({ ok: false, error: "QR_EXPIRED" });
       return;
     }
@@ -2508,14 +2544,14 @@ async function startServer(): Promise<void> {
       acc > 0;
 
     if (hasCoords && !hasValidCoords) {
-      store.addSecurityLog(user.id, "check_in_rejected", "GPS_INVALID_COORDS", ipHash);
+      (await store.addSecurityLog(user.id, "check_in_rejected", "GPS_INVALID_COORDS", ipHash));
       res.status(400).json({ ok: false, error: "LOCATION_INVALID" });
       return;
     }
 
     if (hasValidCoords) {
       if (!validateGpsTimestamp(req.body?.client_captured_at)) {
-        store.addSecurityLog(user.id, "check_in_rejected", "GPS_STALE", ipHash);
+        (await store.addSecurityLog(user.id, "check_in_rejected", "GPS_STALE", ipHash));
         res.status(400).json({ ok: false, error: "GPS_STALE" });
         return;
       }
@@ -2524,28 +2560,28 @@ async function startServer(): Promise<void> {
 
     if (settings.enforce_geofence) {
       if (!hasValidCoords) {
-        store.addSecurityLog(user.id, "check_in_rejected", "GPS_REQUIRED", ipHash);
+        (await store.addSecurityLog(user.id, "check_in_rejected", "GPS_REQUIRED", ipHash));
         res.status(400).json({ ok: false, error: "LOCATION_INVALID" });
         return;
       }
       if (acc > settings.max_gps_accuracy_m) {
-        store.addSecurityLog(user.id, "check_in_rejected", "GPS_POOR_ACCURACY", ipHash, {
+        (await store.addSecurityLog(user.id, "check_in_rejected", "GPS_POOR_ACCURACY", ipHash, {
           accuracy_m: acc,
-        });
+        }));
         res.status(400).json({ ok: false, error: "GPS_POOR_ACCURACY" });
         return;
       }
       if ((distanceM ?? 0) > settings.allowed_radius_m) {
-        store.addSecurityLog(user.id, "check_in_rejected", "OUTSIDE_OFFICE_RADIUS", ipHash, {
+        (await store.addSecurityLog(user.id, "check_in_rejected", "OUTSIDE_OFFICE_RADIUS", ipHash, {
           distance_m: distanceM,
-        });
+        }));
         res.status(400).json({ ok: false, error: "OUTSIDE_CAMPUS" });
         return;
       }
     }
 
     const todayDate = getDateInTimezone(now, settings.timezone);
-    const existingRecord = store.getAttendanceByEmployeeAndDate(user.id, todayDate);
+    const existingRecord = (await store.getAttendanceByEmployeeAndDate(user.id, todayDate));
 
     let resolvedAction: "check_in" | "check_out";
     if (!existingRecord) {
@@ -2569,20 +2605,20 @@ async function startServer(): Promise<void> {
       // Anomaly check: another employee checked in from same IP+UA within last 120s
       const uaHash = getUaHash(req);
       const anomalyCutoffIso = new Date(now.getTime() - 120_000).toISOString();
-      const recentSameDevice = store.findRecentCheckInAnomaly(
+      const recentSameDevice = (await store.findRecentCheckInAnomaly(
         user.id,
         ipHash,
         uaHash,
         anomalyCutoffIso,
-      );
+      ));
       let anomalyNote: string | null = null;
       if (recentSameDevice) {
         anomalyNote = "تنبيه مراجعة: تسجيل من نفس الجهاز/الشبكة لموظف آخر خلال دقيقتين";
-        emitSecurityAlert("high", "attendance_anomaly_detected", req.requestId ?? null, ipHash, {
+        (await emitSecurityAlert("high", "attendance_anomaly_detected", req.requestId ?? null, ipHash, {
           employee_id: user.id,
           other_employee_id: recentSameDevice.user_id,
           entry_method: entryMethod,
-        });
+        }));
       }
 
       const shiftStart = user.shift_start || settings.work_start_time || "09:00";
@@ -2609,7 +2645,7 @@ async function startServer(): Promise<void> {
       };
 
       try {
-        store.commitCheckInScan({
+        (await store.commitCheckInScan({
           tokenId: tokenRow.id,
           employeeId: user.id,
           nowIso,
@@ -2629,7 +2665,7 @@ async function startServer(): Promise<void> {
               ua_hash: uaHash,
             },
           },
-        });
+        }));
       } catch (err) {
         if (err instanceof Error && err.message === "QR_ALREADY_CONSUMED") {
           res.status(400).json({ ok: false, error: "QR_INVALID" });
@@ -2658,7 +2694,7 @@ async function startServer(): Promise<void> {
     const workedMinutes = Math.max(1, Math.round((now.getTime() - checkInMs) / 60000));
 
     try {
-      store.commitCheckOutScan({
+      (await store.commitCheckOutScan({
         tokenId: tokenRow.id,
         employeeId: user.id,
         recordId: existingRecord!.id,
@@ -2678,7 +2714,7 @@ async function startServer(): Promise<void> {
             entry_method: entryMethod,
           },
         },
-      });
+      }));
     } catch (err) {
       if (err instanceof Error && err.message === "QR_ALREADY_CONSUMED") {
         res.status(400).json({ ok: false, error: "QR_INVALID" });
@@ -2720,14 +2756,14 @@ async function startServer(): Promise<void> {
       return;
     }
 
-    const ipHash = getIpHash(req);
+    const ipHash = (await getIpHash(req));
     const rateKey = `admin-stepup:${user.id}:${ipHash}`;
     const rate = await checkDistributedRateLimit(rateKey, 5, 300_000, 900_000);
-    if (!rate.allowed) {
-      store.addSecurityLog(user.id, "admin_step_up_rate_limited", "RATE_LIMITED", ipHash);
-      emitSecurityAlert("critical", "admin_step_up_rate_limited", req.requestId ?? null, ipHash, {
+    if (rate.allowed === false) {
+      (await store.addSecurityLog(user.id, "admin_step_up_rate_limited", "RATE_LIMITED", ipHash));
+      (await emitSecurityAlert("critical", "admin_step_up_rate_limited", req.requestId ?? null, ipHash, {
         admin_id: user.id,
-      });
+      }));
       res.status(429).json({
         ok: false,
         error: "RATE_LIMITED",
@@ -2738,10 +2774,10 @@ async function startServer(): Promise<void> {
 
     const parsed = adminStepUpSchema.safeParse(req.body);
     if (!parsed.success || !verifyPassword(parsed.data.password, user.password_salt, user.password_hash)) {
-      store.addSecurityLog(user.id, "admin_step_up_failed", "INVALID_CREDENTIALS", ipHash);
-      emitSecurityAlert("high", "admin_step_up_failed", req.requestId ?? null, ipHash, {
+      (await store.addSecurityLog(user.id, "admin_step_up_failed", "INVALID_CREDENTIALS", ipHash));
+      (await emitSecurityAlert("high", "admin_step_up_failed", req.requestId ?? null, ipHash, {
         admin_id: user.id,
-      });
+      }));
       res.status(401).json({ ok: false, error: "INVALID_CREDENTIALS" });
       return;
     }
@@ -2760,24 +2796,24 @@ async function startServer(): Promise<void> {
       }
       const totpRes = verifyTotpCode(secretBase32, submittedTotp, user.last_used_totp_step);
       if (!totpRes.valid || totpRes.matchedStep === undefined) {
-        store.addSecurityLog(user.id, "admin_mfa_failed", "INVALID_MFA_CODE", ipHash);
-        emitSecurityAlert("high", "admin_mfa_failed", req.requestId ?? null, ipHash, {
+        (await store.addSecurityLog(user.id, "admin_mfa_failed", "INVALID_MFA_CODE", ipHash));
+        (await emitSecurityAlert("high", "admin_mfa_failed", req.requestId ?? null, ipHash, {
           admin_id: user.id,
-        });
+        }));
         res.status(401).json({ ok: false, error: "INVALID_MFA_CODE", mfa_enabled: true });
         return;
       }
-      store.updateUserLastTotpStep(user.id, totpRes.matchedStep);
+      (await store.updateUserLastTotpStep(user.id, totpRes.matchedStep));
       grantedAal = "aal2";
     }
 
-    resetRateLimit(rateKey);
+    await resetRateLimit(rateKey);
     if (req.authSession) {
       req.authSession.aal = grantedAal;
-      store.updateSessionAal(req.authSession.jti, grantedAal);
+      (await store.updateSessionAal(req.authSession.jti, grantedAal));
     }
     const stepUp = signAdminStepUpToken(user, getUaHash(req), grantedAal);
-    store.addSecurityLog(user.id, "admin_step_up_verified", grantedAal.toUpperCase(), ipHash);
+    (await store.addSecurityLog(user.id, "admin_step_up_verified", grantedAal.toUpperCase(), ipHash));
 
     res.json({
       ok: true,
@@ -2809,7 +2845,7 @@ async function startServer(): Promise<void> {
     "/api/hr/security/mfa/enroll",
     requireAuth,
     requireAdminStepUpForMfaSetup,
-    (req: AuthenticatedRequest, res) => {
+    async (req: AuthenticatedRequest, res) => {
       const user = req.authUser!;
       const secret = generateTotpSecret();
       pendingTotpEnrollments.set(user.id, {
@@ -2818,7 +2854,7 @@ async function startServer(): Promise<void> {
       });
       const label = encodeURIComponent(`InSight:${user.email}`);
       const otpauthUri = `otpauth://totp/${label}?secret=${secret}&issuer=InSight&algorithm=SHA1&digits=6&period=30`;
-      store.addSecurityLog(user.id, "admin_mfa_enroll_started", "OK", getIpHash(req));
+      (await store.addSecurityLog(user.id, "admin_mfa_enroll_started", "OK", (await getIpHash(req))));
 
       res.json({
         ok: true,
@@ -2838,9 +2874,9 @@ async function startServer(): Promise<void> {
     "/api/hr/security/mfa/activate",
     requireAuth,
     requireAdminStepUpForMfaSetup,
-    (req: AuthenticatedRequest, res) => {
+    async (req: AuthenticatedRequest, res) => {
       const user = req.authUser!;
-      const ipHash = getIpHash(req);
+      const ipHash = (await getIpHash(req));
       const parsed = activateMfaSchema.safeParse(req.body);
       if (!parsed.success) {
         res.status(400).json({ ok: false, error: "INVALID_MFA_CODE" });
@@ -2860,19 +2896,19 @@ async function startServer(): Promise<void> {
       }
 
       pendingTotpEnrollments.delete(user.id);
-      store.activateUserMfa(
+      (await store.activateUserMfa(
         user.id,
         pending.secret,
         verified.matchedStep,
         new Date().toISOString(),
-      );
+      ));
       if (req.authSession) {
         req.authSession.aal = "aal2";
-        store.updateSessionAal(req.authSession.jti, "aal2");
+        (await store.updateSessionAal(req.authSession.jti, "aal2"));
       }
 
       const upgradedStepUp = signAdminStepUpToken(user, getUaHash(req), "aal2");
-      store.addSecurityLog(user.id, "admin_mfa_activated", "AAL2_ENABLED", ipHash);
+      (await store.addSecurityLog(user.id, "admin_mfa_activated", "AAL2_ENABLED", ipHash));
 
       res.json({
         ok: true,
@@ -2889,9 +2925,9 @@ async function startServer(): Promise<void> {
     "/api/hr/overview",
     requireAuth,
     requireAdminWithStepUp,
-    (req: AuthenticatedRequest, res) => {
-      const rolesMap = store.getRbacRoles();
-      const currentPerms = resolveUserPermissions(req.authUser!, rolesMap);
+    async (req: AuthenticatedRequest, res) => {
+      const rolesMap = (await store.getRbacRoles());
+      const currentPerms = (await resolveUserPermissions(req.authUser!, rolesMap));
       if (currentPerms.length === 0) {
         res.status(403).json({ ok: false, error: "PERMISSION_DENIED" });
         return;
@@ -2904,23 +2940,23 @@ async function startServer(): Promise<void> {
       const canManageSecurity = currentPerms.includes("manage_security");
       const canManagePermissions = currentPerms.includes("manage_permissions");
 
-      const settings = store.getSettings();
+      const settings = (await store.getSettings());
       const todayDate = getDateInTimezone(new Date(), settings.timezone);
-      const stats = store.getTodayStats(todayDate);
+      const stats = (await store.getTodayStats(todayDate));
 
-      const enrichedRecords = canViewRecords ? store.listEnrichedAttendanceRecords(500) : [];
-      const logs = canManageSecurity ? store.listRecentSecurityLogs(40) : [];
+      const enrichedRecords = canViewRecords ? (await store.listEnrichedAttendanceRecords(500)) : [];
+      const logs = canManageSecurity ? (await store.listRecentSecurityLogs(40)) : [];
       const activeSessions = canManageSecurity
-        ? store.listActiveSessionsWithUser(new Date().toISOString(), req.authJti)
+        ? (await store.listActiveSessionsWithUser(new Date().toISOString(), req.authJti))
         : [];
 
       const employees =
         canManageEmployees || canViewRecords || currentPerms.includes("manage_excuses")
-          ? store.listUsersByRole("employee").map((u) => toPublicProfile(u, rolesMap))
+          ? await Promise.all((await store.listUsersByRole("employee")).map((u) => toPublicProfile(u, rolesMap)))
           : [];
 
       const staffUsers = canManagePermissions
-        ? store.listStaffUsers().map((u) => toPublicProfile(u, rolesMap))
+        ? await Promise.all((await store.listStaffUsers()).map((u) => toPublicProfile(u, rolesMap)))
         : undefined;
 
       res.json({
@@ -2933,14 +2969,14 @@ async function startServer(): Promise<void> {
         records: enrichedRecords,
         settings,
         security_policy:
-          canManageSecurity || canManageSettings ? store.getSecurityPolicy() : undefined,
+          canManageSecurity || canManageSettings ? (await store.getSecurityPolicy()) : undefined,
         rbac_roles: canManagePermissions ? rolesMap : undefined,
         kiosk_devices:
           canManageKiosks || canManageSettings || canManageSecurity
-            ? store.listKiosksWithEmail()
+            ? (await store.listKiosksWithEmail())
             : [],
         security_logs: logs,
-        security_alerts: canManageSecurity ? store.listRecentSecurityAlerts(25) : [],
+        security_alerts: canManageSecurity ? (await store.listRecentSecurityAlerts(25)) : [],
         active_sessions: activeSessions,
         mfa_status: {
           enabled: Boolean(req.authUser!.mfa_enabled),
@@ -2970,7 +3006,7 @@ async function startServer(): Promise<void> {
     requireAuth,
     requireAdminWithStepUp,
     requirePermission("manage_employees"),
-    (req: AuthenticatedRequest, res) => {
+    async (req: AuthenticatedRequest, res) => {
       const parsed = createEmployeeSchema.safeParse(req.body);
       if (!parsed.success) {
         const pwdIssue = parsed.error.issues.some((i) => i.path[0] === "password");
@@ -2990,12 +3026,12 @@ async function startServer(): Promise<void> {
         return;
       }
 
-      if (store.getUserByEmail(email)) {
+      if ((await store.getUserByEmail(email))) {
         res.status(409).json({ ok: false, error: "EMAIL_ALREADY_EXISTS" });
         return;
       }
 
-      if (store.getUserByEmployeeNumber(employeeNumber)) {
+      if ((await store.getUserByEmployeeNumber(employeeNumber))) {
         res.status(409).json({ ok: false, error: "EMPLOYEE_NUMBER_EXISTS" });
         return;
       }
@@ -3020,12 +3056,12 @@ async function startServer(): Promise<void> {
         updated_at: nowIso,
       };
 
-      store.createUser(newEmployee);
-      store.addSecurityLog(req.authUser!.id, "employee_created", "HR_PROVISIONED", getIpHash(req), {
+      (await store.createUser(newEmployee));
+      (await store.addSecurityLog(req.authUser!.id, "employee_created", "HR_PROVISIONED", (await getIpHash(req)), {
         employee_number: employeeNumber,
-      });
+      }));
 
-      res.status(201).json({ ok: true, employee: toPublicProfile(newEmployee) });
+      res.status(201).json({ ok: true, employee: (await toPublicProfile(newEmployee)) });
     },
   );
 
@@ -3046,29 +3082,29 @@ async function startServer(): Promise<void> {
     requireAuth,
     requireAdminWithStepUp,
     requirePermission("manage_employees"),
-    (req: AuthenticatedRequest, res) => {
+    async (req: AuthenticatedRequest, res) => {
       const parsed = updateEmployeeSchema.safeParse(req.body);
       if (!parsed.success) {
         res.status(400).json({ ok: false, error: "INVALID_EMPLOYEE_INPUT" });
         return;
       }
 
-      const updated = store.updateEmployee(
+      const updated = (await store.updateEmployee(
         String(req.params.id),
         parsed.data,
         new Date().toISOString(),
-      );
+      ));
       if (!updated) {
         res.status(404).json({ ok: false, error: "EMPLOYEE_NOT_FOUND" });
         return;
       }
 
-      store.addSecurityLog(req.authUser!.id, "employee_updated", "HR_UPDATED", getIpHash(req), {
+      (await store.addSecurityLog(req.authUser!.id, "employee_updated", "HR_UPDATED", (await getIpHash(req)), {
         target_employee_id: updated.id,
         is_active: updated.is_active,
-      });
+      }));
 
-      res.json({ ok: true, employee: toPublicProfile(updated) });
+      res.json({ ok: true, employee: (await toPublicProfile(updated)) });
     },
   );
 
@@ -3086,7 +3122,7 @@ async function startServer(): Promise<void> {
     requireAuth,
     requireAdminWithStepUp,
     requirePermission("manage_excuses"),
-    (req: AuthenticatedRequest, res) => {
+    async (req: AuthenticatedRequest, res) => {
       const parsed = excuseSchema.safeParse(req.body);
       if (!parsed.success) {
         res.status(400).json({ ok: false, error: "INVALID_EXCUSE_INPUT" });
@@ -3094,17 +3130,17 @@ async function startServer(): Promise<void> {
       }
 
       const { employee_id: employeeId, attendance_date: attendanceDate, notes } = parsed.data;
-      const emp = store.getUserById(employeeId);
+      const emp = (await store.getUserById(employeeId));
       if (!emp || emp.role !== "employee") {
         res.status(404).json({ ok: false, error: "EMPLOYEE_NOT_FOUND" });
         return;
       }
 
-      store.upsertExcuseRecord(employeeId, attendanceDate, notes, new Date().toISOString());
-      store.addSecurityLog(req.authUser!.id, "attendance_excused", "HR_EXCUSE_LOGGED", getIpHash(req), {
+      (await store.upsertExcuseRecord(employeeId, attendanceDate, notes, new Date().toISOString()));
+      (await store.addSecurityLog(req.authUser!.id, "attendance_excused", "HR_EXCUSE_LOGGED", (await getIpHash(req)), {
         employee_number: emp.employee_number,
         attendance_date: attendanceDate,
-      });
+      }));
 
       res.json({ ok: true });
     },
@@ -3141,7 +3177,7 @@ async function startServer(): Promise<void> {
     requireAuth,
     requireAdminWithStepUp,
     requirePermission("manage_settings"),
-    (req: AuthenticatedRequest, res) => {
+    async (req: AuthenticatedRequest, res) => {
       const parsed = updateSettingsSchema.safeParse(req.body ?? {});
       if (!parsed.success) {
         res.status(400).json({ ok: false, error: "INVALID_SETTINGS_INPUT" });
@@ -3149,7 +3185,7 @@ async function startServer(): Promise<void> {
       }
 
       const body = parsed.data;
-      const current = store.getSettings();
+      const current = (await store.getSettings());
       const next: CompanySettings = { ...current };
 
       if (body.timezone !== undefined) {
@@ -3199,13 +3235,13 @@ async function startServer(): Promise<void> {
       }
 
       next.updated_at = new Date().toISOString();
-      store.updateSettings(next);
+      (await store.updateSettings(next));
 
-      store.addSecurityLog(req.authUser!.id, "company_settings_updated", "HR_UPDATED", getIpHash(req), {
+      (await store.addSecurityLog(req.authUser!.id, "company_settings_updated", "HR_UPDATED", (await getIpHash(req)), {
         enforce_geofence: next.enforce_geofence,
         is_enabled: next.is_enabled,
         qr_schedule_enabled: next.qr_schedule_enabled,
-      });
+      }));
 
       res.json({ ok: true, settings: next });
     },
@@ -3227,7 +3263,7 @@ async function startServer(): Promise<void> {
     requireAuth,
     requireAdminWithStepUp,
     requirePermission("manage_kiosks"),
-    (req: AuthenticatedRequest, res) => {
+    async (req: AuthenticatedRequest, res) => {
       const parsed = createKioskSchema.safeParse(req.body);
       if (!parsed.success) {
         const pwdIssue = parsed.error.issues.some((i) => i.path[0] === "password");
@@ -3244,7 +3280,7 @@ async function startServer(): Promise<void> {
         res.status(400).json({ ok: false, error: "WEAK_PASSWORD" });
         return;
       }
-      if (store.getUserByEmail(email)) {
+      if ((await store.getUserByEmail(email))) {
         res.status(409).json({ ok: false, error: "EMAIL_ALREADY_EXISTS" });
         return;
       }
@@ -3280,11 +3316,11 @@ async function startServer(): Promise<void> {
         created_at: nowIso,
       };
 
-      store.createKioskWithUser(kioskUser, newDevice);
-      store.addSecurityLog(req.authUser!.id, "kiosk_device_created", "ADMIN_AUTHORIZED", getIpHash(req), {
+      (await store.createKioskWithUser(kioskUser, newDevice));
+      (await store.addSecurityLog(req.authUser!.id, "kiosk_device_created", "ADMIN_AUTHORIZED", (await getIpHash(req)), {
         device_id: newDevice.id,
         branch_name: newDevice.branch_name,
-      });
+      }));
 
       res.status(201).json({
         ok: true,
@@ -3316,27 +3352,27 @@ async function startServer(): Promise<void> {
     requireAuth,
     requireAdminWithStepUp,
     requirePermission("manage_kiosks"),
-    (req: AuthenticatedRequest, res) => {
+    async (req: AuthenticatedRequest, res) => {
       const parsed = updateKioskSchema.safeParse(req.body ?? {});
       if (!parsed.success) {
         res.status(400).json({ ok: false, error: "INVALID_KIOSK_INPUT" });
         return;
       }
 
-      const updated = store.updateKioskDevice(
+      const updated = (await store.updateKioskDevice(
         String(req.params.id),
         parsed.data,
         new Date().toISOString(),
-      );
+      ));
       if (!updated) {
         res.status(404).json({ ok: false, error: "KIOSK_NOT_FOUND" });
         return;
       }
 
-      store.addSecurityLog(req.authUser!.id, "kiosk_device_updated", "ADMIN_UPDATED", getIpHash(req), {
+      (await store.addSecurityLog(req.authUser!.id, "kiosk_device_updated", "ADMIN_UPDATED", (await getIpHash(req)), {
         device_id: updated.id,
         is_active: updated.is_active,
-      });
+      }));
 
       res.json({ ok: true, device: updated });
     },
@@ -3355,7 +3391,7 @@ async function startServer(): Promise<void> {
     requireAuth,
     requireAdminWithStepUp,
     requirePermission("manage_kiosks"),
-    (req: AuthenticatedRequest, res) => {
+    async (req: AuthenticatedRequest, res) => {
       const parsed = revokeKioskSchema.safeParse(req.body ?? {});
       if (!parsed.success) {
         res.status(400).json({ ok: false, error: "INVALID_KIOSK_INPUT" });
@@ -3374,16 +3410,16 @@ async function startServer(): Promise<void> {
         newSecret.length >= 8
           ? sha256Hex(`${runtimeSecrets.kiosk_salt}:${newSecret}`)
           : undefined;
-      const found = store.revokeKioskSession(deviceId, nowIso, rotatedHash);
+      const found = (await store.revokeKioskSession(deviceId, nowIso, rotatedHash));
       if (!found) {
         res.status(404).json({ ok: false, error: "KIOSK_NOT_FOUND" });
         return;
       }
 
-      store.addSecurityLog(req.authUser!.id, "kiosk_session_revoked", "ADMIN_REVOKED", getIpHash(req), {
+      (await store.addSecurityLog(req.authUser!.id, "kiosk_session_revoked", "ADMIN_REVOKED", (await getIpHash(req)), {
         device_id: deviceId,
         secret_rotated: newSecret.length >= 8,
-      });
+      }));
 
       res.json({ ok: true, revoked_before: nowIso });
     },
@@ -3412,14 +3448,14 @@ async function startServer(): Promise<void> {
     requireAuth,
     requireAdminWithStepUp,
     requirePermission("manage_security"),
-    (req: AuthenticatedRequest, res) => {
+    async (req: AuthenticatedRequest, res) => {
       const parsed = updateSecurityPolicySchema.safeParse(req.body ?? {});
       if (!parsed.success) {
         res.status(400).json({ ok: false, error: "INVALID_SECURITY_POLICY" });
         return;
       }
 
-      const current = store.getSecurityPolicy();
+      const current = (await store.getSecurityPolicy());
       const d = parsed.data;
       const updated: SecurityPolicySettings = {
         cloudflare_enabled: d.cloudflare_enabled ?? current.cloudflare_enabled,
@@ -3434,13 +3470,13 @@ async function startServer(): Promise<void> {
         block_method_override: d.block_method_override ?? current.block_method_override,
         enforce_json_content_type: d.enforce_json_content_type ?? current.enforce_json_content_type,
       };
-      store.updateSecurityPolicy(updated);
+      (await store.updateSecurityPolicy(updated));
 
-      store.addSecurityLog(req.authUser!.id, "security_policy_updated", "ADMIN_UPDATED", getIpHash(req), {
+      (await store.addSecurityLog(req.authUser!.id, "security_policy_updated", "ADMIN_UPDATED", (await getIpHash(req)), {
         cloudflare_enabled: updated.cloudflare_enabled,
         turnstile_enabled: updated.turnstile_enabled,
         strict_ip_binding: updated.strict_ip_binding,
-      });
+      }));
 
       res.json({ ok: true, security_policy: updated });
     },
@@ -3458,9 +3494,9 @@ async function startServer(): Promise<void> {
     requireAuth,
     requireAdminWithStepUp,
     requirePermission("manage_permissions"),
-    (req: AuthenticatedRequest, res) => {
+    async (req: AuthenticatedRequest, res) => {
       const roleKey = String(req.params.roleKey ?? "").trim();
-      const rolesMap = store.getRbacRoles();
+      const rolesMap = (await store.getRbacRoles());
       if (!rolesMap[roleKey]) {
         res.status(404).json({ ok: false, error: "ROLE_NOT_FOUND" });
         return;
@@ -3476,12 +3512,12 @@ async function startServer(): Promise<void> {
       if (roleKey === "super_admin" && !uniquePerms.includes("manage_permissions")) {
         uniquePerms.push("manage_permissions");
       }
-      const nextRoles = store.updateRbacRolePermissions(roleKey, uniquePerms) ?? rolesMap;
+      const nextRoles = (await store.updateRbacRolePermissions(roleKey, uniquePerms)) ?? rolesMap;
 
-      store.addSecurityLog(req.authUser!.id, "rbac_role_updated", "ADMIN_UPDATED", getIpHash(req), {
+      (await store.addSecurityLog(req.authUser!.id, "rbac_role_updated", "ADMIN_UPDATED", (await getIpHash(req)), {
         role_key: roleKey,
         permissions_count: uniquePerms.length,
-      });
+      }));
 
       res.json({ ok: true, rbac_roles: nextRoles });
     },
@@ -3504,8 +3540,8 @@ async function startServer(): Promise<void> {
     requireAuth,
     requireAdminWithStepUp,
     requirePermission("manage_permissions"),
-    (req: AuthenticatedRequest, res) => {
-      const targetUser = store.getUserById(String(req.params.userId));
+    async (req: AuthenticatedRequest, res) => {
+      const targetUser = (await store.getUserById(String(req.params.userId)));
       if (!targetUser || targetUser.role === "kiosk") {
         res.status(404).json({ ok: false, error: "USER_NOT_FOUND" });
         return;
@@ -3517,11 +3553,10 @@ async function startServer(): Promise<void> {
         return;
       }
 
-      const rolesMap = store.getRbacRoles();
-      const adminUsers = store.listUsersByRole("admin");
-      const activeSuperAdmins = adminUsers.filter(
-        (u) => u.is_active && resolveUserPermissions(u, rolesMap).includes("manage_permissions"),
-      );
+      const rolesMap = (await store.getRbacRoles());
+      const adminUsers = (await store.listUsersByRole("admin"));
+      const adminPermissions = await Promise.all(adminUsers.map((u) => resolveUserPermissions(u, rolesMap)));
+      const activeSuperAdmins = adminUsers.filter((u, index) => u.is_active && adminPermissions[index].includes("manage_permissions"));
       if (
         targetUser.id === req.authUser!.id &&
         activeSuperAdmins.length <= 1 &&
@@ -3549,21 +3584,21 @@ async function startServer(): Promise<void> {
             : undefined;
       }
 
-      const updatedUser = store.updateUserRbac(
+      const updatedUser = (await store.updateUserRbac(
         targetUser.id,
         parsed.data.role,
         nextAdminRoleKey,
         nextPermissions,
         new Date().toISOString(),
-      );
+      ));
 
-      store.addSecurityLog(req.authUser!.id, "user_permissions_updated", "ADMIN_UPDATED", getIpHash(req), {
+      (await store.addSecurityLog(req.authUser!.id, "user_permissions_updated", "ADMIN_UPDATED", (await getIpHash(req)), {
         target_user_id: targetUser.id,
         role: parsed.data.role,
         admin_role_key: nextAdminRoleKey,
-      });
+      }));
 
-      res.json({ ok: true, user: toPublicProfile(updatedUser ?? targetUser, rolesMap) });
+      res.json({ ok: true, user: (await toPublicProfile(updatedUser ?? targetUser, rolesMap)) });
     },
   );
 
@@ -3573,17 +3608,17 @@ async function startServer(): Promise<void> {
     requireAuth,
     requireAdminWithStepUp,
     requirePermission("manage_security"),
-    (req: AuthenticatedRequest, res) => {
+    async (req: AuthenticatedRequest, res) => {
       const targetJti = String(req.params.jti ?? "").trim();
-      const target = store.getActiveSessionByJti(targetJti);
+      const target = (await store.getActiveSessionByJti(targetJti));
       if (!target) {
         res.status(404).json({ ok: false, error: "SESSION_NOT_FOUND" });
         return;
       }
-      store.revokeSessionByJti(targetJti);
-      store.addSecurityLog(req.authUser!.id, "session_revoked_by_admin", "ADMIN_REVOKED", getIpHash(req), {
+      (await store.revokeSessionByJti(targetJti));
+      (await store.addSecurityLog(req.authUser!.id, "session_revoked_by_admin", "ADMIN_REVOKED", (await getIpHash(req)), {
         target_user_id: target.user_id,
-      });
+      }));
       res.json({ ok: true });
     },
   );
@@ -3594,22 +3629,22 @@ async function startServer(): Promise<void> {
     requireAuth,
     requireAdminWithStepUp,
     requirePermission("manage_security"),
-    (req: AuthenticatedRequest, res) => {
+    async (req: AuthenticatedRequest, res) => {
       const nowIso = new Date().toISOString();
-      const affected = store.emergencyLockdownOtherUsers(req.authUser!.id, nowIso);
+      const affected = (await store.emergencyLockdownOtherUsers(req.authUser!.id, nowIso));
 
-      const ipHash = getIpHash(req);
-      store.addSecurityLog(
+      const ipHash = (await getIpHash(req));
+      (await store.addSecurityLog(
         req.authUser!.id,
         "global_sessions_revoked",
         "ADMIN_EMERGENCY_LOCKDOWN",
         ipHash,
         { affected_accounts: affected },
-      );
-      emitSecurityAlert("critical", "global_sessions_revoked", req.requestId ?? null, ipHash, {
+      ));
+      (await emitSecurityAlert("critical", "global_sessions_revoked", req.requestId ?? null, ipHash, {
         admin_id: req.authUser!.id,
         affected_accounts: affected,
-      });
+      }));
 
       res.json({ ok: true, affected_accounts: affected });
     },
@@ -3627,7 +3662,7 @@ async function startServer(): Promise<void> {
     requireAuth,
     requireAdminWithStepUp,
     requirePermission("manage_security"),
-    (req: AuthenticatedRequest, res) => {
+    async (req: AuthenticatedRequest, res) => {
       const parsed = backupSchema.safeParse(req.body);
       if (!parsed.success) {
         res.status(400).json({ ok: false, error: "WEAK_BACKUP_PASSPHRASE" });
@@ -3635,9 +3670,9 @@ async function startServer(): Promise<void> {
       }
       const salt = crypto.randomBytes(16);
       const derivedKey = crypto.pbkdf2Sync(parsed.data.passphrase, salt, 210_000, 32, "sha256");
-      const backupPayload = store.exportBackupPayload();
+      const backupPayload = (await store.exportBackupPayload());
       const sealedEnvelope = JSON.parse(encryptJsonPayload(JSON.stringify(backupPayload), derivedKey));
-      store.addSecurityLog(req.authUser!.id, "encrypted_backup_exported", "OK", getIpHash(req));
+      (await store.addSecurityLog(req.authUser!.id, "encrypted_backup_exported", "OK", (await getIpHash(req))));
 
       res.json({
         ok: true,
@@ -3659,7 +3694,7 @@ async function startServer(): Promise<void> {
     requireAuth,
     requireAdminWithStepUp,
     requirePermission("export_reports"),
-    (req: AuthenticatedRequest, res) => {
+    async (req: AuthenticatedRequest, res) => {
       const fromDate = typeof req.query.from === "string" ? req.query.from : "";
       const toDate = typeof req.query.to === "string" ? req.query.to : "";
       const department = typeof req.query.department === "string" ? req.query.department : "";
@@ -3673,20 +3708,20 @@ async function startServer(): Promise<void> {
         }
       }
 
-      const filtered = store.queryAttendanceForExport({
+      const filtered = (await store.queryAttendanceForExport({
         fromDate: fromDate || undefined,
         toDate: toDate || undefined,
         department: department || undefined,
         statusFilter: statusFilter || undefined,
         limit: 50_001,
-      });
+      }));
 
       if (filtered.length > 50_000) {
         res.status(400).json({ ok: false, error: "EXPORT_LIMIT_EXCEEDED" });
         return;
       }
 
-      const settings = store.getSettings();
+      const settings = (await store.getSettings());
       const header = [
         "الرقم الوظيفي",
         "اسم الموظف",
@@ -3742,11 +3777,11 @@ async function startServer(): Promise<void> {
           .join(","),
       );
 
-      store.addSecurityLog(req.authUser!.id, "export_downloaded", "OK", getIpHash(req), {
+      (await store.addSecurityLog(req.authUser!.id, "export_downloaded", "OK", (await getIpHash(req)), {
         row_count: filtered.length,
         from: fromDate || null,
         to: toDate || null,
-      });
+      }));
 
       const csv = `\uFEFF${[header, ...lines].join("\r\n")}`;
       const filename = `insight-attendance-${fromDate || "all"}-to-${toDate || "today"}.csv`;
@@ -3758,7 +3793,7 @@ async function startServer(): Promise<void> {
   // Global error handler — never expose stack traces or SQL/environment details to clients
   app.use((err: unknown, req: AuthenticatedRequest, res: Response, _next: NextFunction) => {
     const reqId = req.requestId ?? crypto.randomUUID();
-    console.error(`[${reqId}] Unhandled server error:`, err instanceof Error ? err.message : err);
+    console.error(`[${reqId}] Unhandled server error:`, err instanceof Error ? err.name : "UnknownError");
     if (!res.headersSent) {
       res.status(500).json({
         ok: false,
@@ -3768,16 +3803,17 @@ async function startServer(): Promise<void> {
     }
   });
 
-  if (process.env.NODE_ENV === "production") {
+  // Static files and frontend routes are handled by the Netlify CDN.
+  if (IS_NETLIFY) {
+    app.use("/api", (_req, res) => res.status(404).json({ ok: false, error: "NOT_FOUND" }));
+    return app;
+  }
+
+  if (IS_PRODUCTION) {
     const distDir = path.resolve(process.cwd(), "dist");
     app.use(express.static(distDir));
-    app.get("*", (_req, res) => {
-      res.sendFile(path.join(distDir, "index.html"));
-    });
-    app.listen(PORT, "0.0.0.0", () => {
-      console.log(`InSight Attendance Server running on http://0.0.0.0:${PORT}`);
-    });
-    return;
+    app.get("*", (_req, res) => res.sendFile(path.join(distDir, "index.html")));
+    return app;
   }
 
   let viteMiddleware: NextFunction | null = null;
@@ -3805,9 +3841,12 @@ async function startServer(): Promise<void> {
     next();
   });
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`InSight Attendance Server running on http://0.0.0.0:${PORT}`);
-  });
+  return app;
 }
 
-void startServer();
+if (!IS_NETLIFY) {
+  const app = await createAttendanceApp();
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`InSight Attendance Server listening on port ${PORT}`);
+  });
+}
