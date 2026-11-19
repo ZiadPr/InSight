@@ -1,0 +1,7 @@
+/login          /index.html  200
+/employee       /index.html  200
+/employee/*     /index.html  200
+/hr             /index.html  200
+/kiosk          /index.html  200
+/student        /index.html  200
+/student/*      /index.html  200

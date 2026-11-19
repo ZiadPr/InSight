@@ -281,7 +281,8 @@ test("SQL migrations enable RLS, disable placeholder campus, lock default privil
 test("Backend server enforces AES-256-GCM encryption at rest, SQLite WAL targeted writes, E2EE transport, Admin Step-Up, and SQLi/XSS WAF libraries", () => {
   const serverSource = fs.readFileSync(path.resolve(process.cwd(), "server.ts"), "utf8");
   const storeSource = fs.readFileSync(path.resolve(process.cwd(), "server/sqliteStore.ts"), "utf8");
-  assert.ok(storeSource.includes("aes-256-gcm"), "Expected AES-256-GCM encryption at rest");
+  const domainSource = fs.readFileSync(path.resolve(process.cwd(), "server/domain.ts"), "utf8");
+  assert.ok(domainSource.includes("aes-256-gcm"), "Expected AES-256-GCM encryption at rest");
   assert.ok(storeSource.includes('from "better-sqlite3"'), "Expected better-sqlite3 storage engine");
   assert.ok(storeSource.includes("journal_mode = WAL"), "Expected SQLite WAL mode");
   assert.ok(storeSource.includes("idx_attendance_emp_date"), "Expected index on (employee_id, attendance_date)");
